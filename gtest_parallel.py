@@ -53,6 +53,7 @@ else:
 # return the result. Once a SIGINT has been seen (in the main process
 # or a subprocess, including the one the current call is waiting for),
 # wait(p) will call p.terminate() and raise ProcessWasInterrupted.
+'''
 class SigintHandler(object):
   class ProcessWasInterrupted(Exception): pass
   sigint_returncodes = {-signal.SIGINT,  # Unix
@@ -76,12 +77,12 @@ class SigintHandler(object):
   def got_sigint(self):
     with self.__lock:
       return self.__got_sigint
-  def wait(self, p):
+  def wait(self, p, timeout = None):
     with self.__lock:
       if self.__got_sigint:
         p.terminate()
       self.__processes.add(p)
-    code = p.wait()
+    code = p.wait(timeout)
     with self.__lock:
       self.__processes.discard(p)
       if code in self.sigint_returncodes:
@@ -90,7 +91,7 @@ class SigintHandler(object):
         raise self.ProcessWasInterrupted
     return code
 sigint_handler = SigintHandler()
-
+'''
 
 # Return the width of the terminal, or None if it couldn't be
 # determined (e.g. because we're not being run interactively).
@@ -187,7 +188,14 @@ class Task(object):
             self.last_execution_time)
 
   def __eq__(self, other):
-      return self.__sorting_key() == other.__sorting_key()
+      #return self.__sorting_key() == other.__sorting_key()
+    return self.id() == other.id()
+
+  def id(self):
+    return self.test_binary + self.test_name
+
+  def __hash__(self):
+    return hash(self.id())
 
   def __ne__(self, other):
       return not (self == other)
@@ -213,13 +221,14 @@ class Task(object):
 
     return os.path.join(output_dir, log_name)
 
-  def run(self):
+  def run(self, timeout = None):
     begin = time.time()
     with open(self.log_file, 'w') as log:
       task = subprocess.Popen(self.test_command, stdout=log, stderr=log)
       try:
-        self.exit_code = sigint_handler.wait(task)
-      except sigint_handler.ProcessWasInterrupted:
+        #self.exit_code = sigint_handler.wait(task, timeout)
+        self.exit_code = task.wait(timeout)
+      except (sigint_handler.ProcessWasInterrupted, subprocess.TimeoutExpired):
         thread.exit()
     self.runtime_ms = int(1000 * (time.time() - begin))
     self.last_execution_time = None if self.exit_code else self.runtime_ms
@@ -277,10 +286,10 @@ class TaskManager(object):
       else:
         self.failed.append(task)
 
-  def run_task(self, task):
+  def run_task(self, task, timeout = None):
     for try_number in range(self.times_to_retry + 1):
       self.__register_start(task)
-      task.run()
+      task.run(timeout)
       self.__register_exit(task)
 
       if task.exit_code == 0:
@@ -564,6 +573,44 @@ class TestTimes(object):
     else:
       return times
 
+def exclude_tasks(tasks, tasks_exclude):
+  tasks_set = set(tasks)
+  tasks_exclude_set = set(tasks_exclude)
+
+  return list(tasks_set.difference(tasks_exclude_set))
+
+
+# load tests from persis file
+# single bynary
+def find_tests_persist(persist_file, test_binary, additional_args, options, times):
+  test_count = 0
+  tasks = []
+  command = [test_binary]
+
+  persist_files = []
+  if type(persist_file) in [list,tuple]:
+    persist_files = persist_file;
+  else:
+    persist_files = [persist_file]
+
+  test_list = []
+  for one_file in persist_files:
+    file = open(one_file, 'r')
+    test_list.extend(file.readlines())
+
+  # persist file format: test_name | status (OK, FAIL, DEAD) | exec time
+  for line in test_list:
+    if not line.strip():
+      continue
+    command = [test_binary]
+    test_name = line.split()[0]
+    test_command = command + ['--gtest_filter=' + test_name]
+    last_execution_time = times.get_test_time(test_binary, test_name)
+    tasks.append(Task(test_binary, test_name, test_command,
+                      1, last_execution_time,
+                      options.output_dir))
+
+  return tasks
 
 def find_tests(binaries, additional_args, options, times):
   test_count = 0
@@ -627,7 +674,7 @@ def find_tests(binaries, additional_args, options, times):
 
 
 def execute_tasks(tasks, pool_size, task_manager,
-                  timeout, serialize_test_cases):
+                  timeout, serialize_test_cases, test_timeout = None):
   class WorkerFn(object):
     def __init__(self, tasks, running_groups):
       self.tasks = tasks
@@ -655,7 +702,7 @@ def execute_tasks(tasks, pool_size, task_manager,
             # cases (groups) is less than number or running threads.
             return
 
-        task_manager.run_task(task)
+        task_manager.run_task(task, test_timeout)
 
         if self.running_groups is not None:
           with self.task_lock:
@@ -673,6 +720,18 @@ def execute_tasks(tasks, pool_size, task_manager,
     running_groups = set() if serialize_test_cases else None
     worker_fn = WorkerFn(tasks, running_groups)
     workers = [start_daemon(worker_fn) for _ in range(pool_size)]
+    # check worker status
+
+    while True:
+      if (len(tasks) == 0):
+        break
+      worker_count = sum([worker.is_alive() for worker in workers])
+      if worker_count < pool_size:
+        print("Start new worker. Worker count was ", worker_count)
+        workers.append(start_daemon(worker_fn))
+
+      time.sleep(1)
+
     for worker in workers:
       worker.join()
   finally:
@@ -719,10 +778,26 @@ def default_options_parser():
   parser.add_option('--timeout', type='int', default=None,
                     help='Interrupt all remaining processes after the given '
                          'time (in seconds).')
+
+  parser.add_option('--test_timeout', type='int', default=None,
+                    help='Interrupt test after the given '
+                         'time (in seconds).')
+
   parser.add_option('--serialize_test_cases', action='store_true',
                     default=False, help='Do not run tests from the same test '
                                         'case in parallel.')
+  parser.add_option('--list', action='store_true',
+                    default=False, help='list all tests')
+  parser.add_option('-p', '--persist_file', action="append", type='string', default=None,
+                    help='file with persistence info')
+  parser.add_option('-m', '--persist_mode', type='string', default=None,
+                    help='Mode: exclude (remove tests in persist file from execution list)')
+
   return parser
+
+# Record of test runtimes. Has built-in locking.
+#class PersistState(object):
+#  return None  
 
 
 def main():
@@ -784,7 +859,13 @@ def main():
 
   timeout = None
   if options.timeout is not None:
-    timeout = threading.Timer(options.timeout, sigint_handler.interrupt)
+    timeout = options.timeout
+    #timeout = threading.Timer(options.timeout, sigint_handler.interrupt)
+
+  test_timeout = None
+  if options.test_timeout is not None:
+    test_timeout = options.test_timeout
+
 
   test_results = None
   if options.dump_json_test_results is not None:
@@ -799,9 +880,27 @@ def main():
                              options.retry_failed, options.repeat + 1)
 
   tasks = find_tests(binaries, additional_args, options, times)
+  
+  persist_tasks = []
+  if (options.persist_file):
+    persist_tasks = find_tests_persist(options.persist_file, binaries[0], additional_args, options, times)
+    
+  if (options.list):
+    for t in tasks:
+      print(t.test_name)
+    return 0
+
+  print("task len = ", len(tasks))
+
+  if (options.persist_mode == 'exclude'):
+    tasks = exclude_tasks(tasks, persist_tasks)
+
   logger.log_tasks(len(tasks))
+
+  print("task len = ", len(tasks))
+  #return
   execute_tasks(tasks, options.workers, task_manager,
-                timeout, options.serialize_test_cases)
+                timeout, options.serialize_test_cases, test_timeout)
 
   print_try_number = options.retry_failed > 0 or options.repeat > 1
   if task_manager.passed:
@@ -834,3 +933,5 @@ def main():
 
 if __name__ == "__main__":
   sys.exit(main())
+
+# .+\[       OK\ ] ([^ ]+) .+
