@@ -43,6 +43,7 @@ if sys.platform == 'win32':
 else:
   import fcntl
 
+exitapp = False
 
 # An object that catches SIGINT sent to the Python process and notices
 # if processes passed to wait() die by SIGINT (we need to look for
@@ -53,7 +54,7 @@ else:
 # return the result. Once a SIGINT has been seen (in the main process
 # or a subprocess, including the one the current call is waiting for),
 # wait(p) will call p.terminate() and raise ProcessWasInterrupted.
-'''
+
 class SigintHandler(object):
   class ProcessWasInterrupted(Exception): pass
   sigint_returncodes = {-signal.SIGINT,  # Unix
@@ -90,8 +91,8 @@ class SigintHandler(object):
       if self.__got_sigint:
         raise self.ProcessWasInterrupted
     return code
-sigint_handler = SigintHandler()
-'''
+#sigint_handler = SigintHandler()
+
 
 # Return the width of the terminal, or None if it couldn't be
 # determined (e.g. because we're not being run interactively).
@@ -114,10 +115,11 @@ def term_width(out):
 # use this to ensure that lots of unimportant info (tests passing)
 # won't drown out important info (tests failing).
 class Outputter(object):
-  def __init__(self, out_file):
+  def __init__(self, out_file, second_file = None):
     self.__out_file = out_file
     self.__previous_line_was_transient = False
     self.__width = term_width(out_file)  # Line width, or None if not a tty.
+    self.__second_file = second_file
   def transient_line(self, msg):
     if self.__width is None:
       self.__out_file.write(msg + "\n")
@@ -126,11 +128,17 @@ class Outputter(object):
       self.__previous_line_was_transient = True
   def flush_transient_output(self):
     if self.__previous_line_was_transient:
-      self.__out_file.write("\n")
+      self.write("\n")
       self.__previous_line_was_transient = False
   def permanent_line(self, msg):
     self.flush_transient_output()
-    self.__out_file.write(msg + "\n")
+    self.write(msg + "\n")
+  def write(self, msg):
+    self.__out_file.write(msg)
+    if self.__second_file is not None:
+      self.__second_file.write(msg)
+      self.__second_file.flush()
+
 
 
 def get_save_file_path():
@@ -228,7 +236,7 @@ class Task(object):
       try:
         #self.exit_code = sigint_handler.wait(task, timeout)
         self.exit_code = task.wait(timeout)
-      except (sigint_handler.ProcessWasInterrupted, subprocess.TimeoutExpired):
+      except (subprocess.TimeoutExpired):
         thread.exit()
     self.runtime_ms = int(1000 * (time.time() - begin))
     self.last_execution_time = None if self.exit_code else self.runtime_ms
@@ -309,7 +317,7 @@ class TaskManager(object):
 
 
 class FilterFormat(object):
-  def __init__(self, output_dir):
+  def __init__(self, output_dir, logfile = None):
     if sys.stdout.isatty():
       # stdout needs to be unbuffered since the output is interactive.
       if isinstance(sys.stdout, io.TextIOWrapper):
@@ -325,7 +333,10 @@ class FilterFormat(object):
 
     self.total_tasks = 0
     self.finished_tasks = 0
-    self.out = Outputter(sys.stdout)
+    if logfile is not None:
+      logfile = open(logfile, 'w')
+
+    self.out = Outputter(sys.stdout, logfile)
     self.stdout_lock = threading.Lock()
 
   def move_to(self, destination_dir, tasks):
@@ -417,6 +428,9 @@ class FilterFormat(object):
 
   def flush(self):
     self.out.flush_transient_output()
+
+  def write(self, msg):
+    self.out.write(msg)
 
 
 class CollectTestResults(object):
@@ -576,9 +590,12 @@ class TestTimes(object):
 def exclude_tasks(tasks, tasks_exclude):
   tasks_set = set(tasks)
   tasks_exclude_set = set(tasks_exclude)
-
   return list(tasks_set.difference(tasks_exclude_set))
 
+def intersect_tasks(tasks, tasks_exclude):
+  tasks_set = set(tasks)
+  tasks_exclude_set = set(tasks_exclude)
+  return list(tasks_set.intersection(tasks_exclude_set))
 
 # load tests from persis file
 # single bynary
@@ -702,6 +719,9 @@ def execute_tasks(tasks, pool_size, task_manager,
             # cases (groups) is less than number or running threads.
             return
 
+        if exitapp:
+          return
+
         task_manager.run_task(task, test_timeout)
 
         if self.running_groups is not None:
@@ -732,8 +752,8 @@ def execute_tasks(tasks, pool_size, task_manager,
 
       time.sleep(1)
 
-    for worker in workers:
-      worker.join()
+    #for worker in workers:
+    #  worker.join()
   finally:
     if timeout:
       timeout.cancel()
@@ -792,6 +812,14 @@ def default_options_parser():
                     help='file with persistence info')
   parser.add_option('-m', '--persist_mode', type='string', default=None,
                     help='Mode: exclude (remove tests in persist file from execution list)')
+
+  parser.add_option('--log', type='string', default=None,
+                    help='File to store console output')
+
+  #--use_test_list
+  #action='callback', callback=vararg_callback
+
+  parser.add_option('--test_list', type='string', action="append", default=[])
 
   return parser
 
@@ -874,7 +902,7 @@ def main():
   save_file = get_save_file_path()
 
   times = TestTimes(save_file)
-  logger = FilterFormat(options.output_dir)
+  logger = FilterFormat(options.output_dir, options.log)
 
   task_manager = TaskManager(times, logger, test_results, Task,
                              options.retry_failed, options.repeat + 1)
@@ -894,11 +922,18 @@ def main():
 
   if (options.persist_mode == 'exclude'):
     tasks = exclude_tasks(tasks, persist_tasks)
+  elif (options.persist_mode == 'run'):
+    print("run mode, persist list len ", len(persist_tasks))
+    tasks = intersect_tasks(tasks, persist_tasks)
+    print("final list len ", len(tasks))
+  elif (options.persist_mode != None):
+    print( "unknown repsist mode ", options.persist_mode)
+    sys.exit(1)
 
   logger.log_tasks(len(tasks))
 
   print("task len = ", len(tasks))
-  #return
+#  return
   execute_tasks(tasks, options.workers, task_manager,
                 timeout, options.serialize_test_cases, test_timeout)
 
@@ -926,12 +961,24 @@ def main():
   if test_results:
     test_results.dump_to_file_and_close()
 
-  if sigint_handler.got_sigint():
-    return -signal.SIGINT
+  #if sigint_handler.got_sigint():
+  #  return -signal.SIGINT
 
   return task_manager.global_exit_code
 
 if __name__ == "__main__":
-  sys.exit(main())
+  try:
+    sys.exit(main())
+  except KeyboardInterrupt:
+    exitapp = True
+
+  print("Ctrl-C pressed")
+  print("Waiting processes to complete")
+  while threading.active_count() > 1:
+    time.sleep(0.1)
+
+  print("Process interrupted")
+  sys.exit(1)
+
 
 # .+\[       OK\ ] ([^ ]+) .+
