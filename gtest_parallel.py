@@ -232,11 +232,13 @@ class Task(object):
   def run(self, timeout = None):
     begin = time.time()
     with open(self.log_file, 'w') as log:
-      task = subprocess.Popen(self.test_command, stdout=log, stderr=log)
+      task = subprocess.Popen(self.test_command, stdout=log, stderr=log, shell=False)
       try:
         #self.exit_code = sigint_handler.wait(task, timeout)
         self.exit_code = task.wait(timeout)
       except (subprocess.TimeoutExpired):
+        task.kill()
+        task.wait(5)
         thread.exit()
     self.runtime_ms = int(1000 * (time.time() - begin))
     self.last_execution_time = None if self.exit_code else self.runtime_ms
@@ -729,6 +731,7 @@ def execute_tasks(tasks, pool_size, task_manager,
             self.running_groups.remove(test_group)
 
   def start_daemon(func):
+    print("Starting new daemon...")
     t = threading.Thread(target=func)
     t.daemon = True
     t.start()
@@ -967,18 +970,20 @@ def main():
   return task_manager.global_exit_code
 
 if __name__ == "__main__":
+  exitcode = 0
   try:
-    sys.exit(main())
+    exitcode = main()
   except KeyboardInterrupt:
-    exitapp = True
+    exitcode = 111
+    print("Ctrl-C pressed")
+    print("Process interrupted")
 
-  print("Ctrl-C pressed")
+  exitapp = True
   print("Waiting processes to complete")
   while threading.active_count() > 1:
     time.sleep(0.1)
 
-  print("Process interrupted")
-  sys.exit(1)
+  sys.exit(exitcode)
 
 
 # .+\[       OK\ ] ([^ ]+) .+
